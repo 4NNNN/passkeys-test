@@ -68,6 +68,179 @@ export class Passkey {
     }
   }
 
+  static importPublicKeyAsCryptoKey = async (
+    publicKey: ArrayBuffer,
+  ): Promise<CryptoKey | null> => {
+    logger.debug(
+      "(🔑,ℹ️) Parsing webauthn response public key as CryptoKey via Web Crypto API",
+    );
+    try {
+      const key = await crypto.subtle.importKey(
+        // The getPublicKey() operation thus returns the credential public key as a SubjectPublicKeyInfo. See:
+        // https://w3c.github.io/webauthn/#sctn-public-key-easy
+        // crypto.subtle can import the spki format:
+        // https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/importKey
+        "spki", // "spki" Simple Public Key Infrastructure rfc2692
+        publicKey,
+        {
+          // these are the algorithm options
+          // await cred.response.getPublicKeyAlgorithm() // returns -7
+          // -7 is ES256 with P-256 // search -7 in https://w3c.github.io/webauthn
+          // the W3C webcrypto docs:
+          // https://www.w3.org/TR/WebCryptoAPI/#informative-references (scroll down a bit)
+          // ES256 corrisponds with the following AlgorithmIdentifier:
+          name: "ECDSA",
+          namedCurve: "P-256",
+          hash: { name: "SHA-256" },
+        },
+        true, //whether the key is extractable (i.e. can be used in exportKey)
+        ["verify"], //"verify" for public key import, "sign" for private key imports
+      );
+      return key;
+    } catch (e) {
+      logger.error(PASSKEY_ERRORS.PUBLIC_KEY_CANT_BE_PARSED_AS_CRYPTO_KEY, e);
+      return null;
+    }
+  };
+
+  static async getPublicKeyXYCoordinate(
+    publicKey: CryptoKey,
+  ): Promise<[string, string] | undefined> {
+    let jwkKey;
+    try {
+      jwkKey = await window.crypto.subtle.exportKey("jwk", publicKey);
+      logger.debug("JWK key :", jwkKey);
+    } catch (err) {
+      console.error("Failed to export key:", err);
+      return;
+    }
+    if (jwkKey) {
+      const pubKeyX = `0x${Passkey.buf2hex(Passkey.parseBase64url(jwkKey.x!))}`;
+      const pubKeyY = `0x${Passkey.buf2hex(Passkey.parseBase64url(jwkKey.y!))}`;
+      logger.debug("pubKeyX:", pubKeyX);
+      logger.debug("pubKeyY:", pubKeyY);
+      return [pubKeyX, pubKeyY];
+    }
+  }
+
+
+  static normalizeSignature(signature: ArrayBuffer): { r: bigint; s: bigint } {
+    // Convert signature from ASN.1 sequence to "raw" format
+    const usignature = new Uint8Array(signature);
+    const rStart = usignature[4] === 0 ? 5 : 4;
+    const rEnd = rStart + 32;
+    const sStart = usignature[rEnd + 2] === 0 ? rEnd + 3 : rEnd + 2;
+    const r = BigInt(`0x${Passkey.buf2hex(usignature.slice(rStart, rEnd))}`);
+    let s = BigInt(`0x${Passkey.buf2hex(usignature.slice(sStart))}`);
+
+    // Avoid malleability. Ensure low S (<= N/2 where N is the curve order)
+    const n = BigInt(
+      "0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551",
+    );
+    if (s > n / BigInt(2)) {
+      s = n - s;
+    }
+    return { r, s };
+  }
+
+  static async getPasskeySignatureData(
+    challenge: string,
+    allowCredentials?: PublicKeyCredentialDescriptor[],
+  ) {
+    let assertion: any;
+    try {
+      logger.debug("(🪪,ℹ️) Obtaining credentials");
+      const challengeBuf = Passkey.hex2buf(challenge.substring(2));
+      logger.debug("(🪄,ℹ️) Challenge", challenge);
+      logger.debug(
+        "(🪄,ℹ️) Challenge (base64)",
+        Passkey.toBase64url(challengeBuf),
+      );
+      logger.debug("(🪄,ℹ️) Challenge (hex)", Passkey.buf2hex(challengeBuf));
+
+      const publicKeyCredentialRequestOptions: PublicKeyCredentialRequestOptions =
+      {
+        challenge: challengeBuf,
+        timeout: 60000,
+        allowCredentials,
+      };
+
+      assertion = (await navigator.credentials.get({
+        publicKey: publicKeyCredentialRequestOptions,
+      })) as PublicKeyCredential;
+    } catch (e) {
+      logger.error(PASSKEY_ERRORS.UNABLE_TO_RETRIEVE_CREDENTIAL, e);
+      return {
+        authenticatorData: "",
+        requireUserVerification: false,
+        clientDataJson: "",
+        challengeLocation: 0,
+        responseTypeLocation: 0,
+        r: "",
+        s: "",
+        error: PASSKEY_ERRORS.UNABLE_TO_RETRIEVE_CREDENTIAL,
+      };
+    }
+    if (!assertion) {
+      return {
+        authenticatorData: "",
+        requireUserVerification: false,
+        clientDataJson: "",
+        challengeLocation: 0,
+        responseTypeLocation: 0,
+        r: "",
+        s: "",
+        error: PASSKEY_ERRORS.UNABLE_TO_RETRIEVE_CREDENTIAL,
+      };
+    }
+    logger.debug("(🪪,✅) Assertion", assertion);
+    logger.debug({
+      title: "Assertion obtained.",
+      description: "Your assertion has been retrieved.",
+      status: "success",
+      duration: 9000,
+      isClosable: true,
+    });
+
+    const assertation = assertion.response as AuthenticatorAssertionResponse;
+    // rough lengths per attr: signature = 140+/-5, authenticatorData = 74, clientData = 200+
+    logger.debug("(📥,ℹ️), assertation", assertation);
+    const { signature, clientDataJSON, authenticatorData } = assertation;
+
+
+    const obtainedClientDataJSON: WebauthnChallenge = JSON.parse(
+      new TextDecoder().decode(clientDataJSON),
+    );
+
+    const authenticatorDataString = `0x${Passkey.buf2hex(authenticatorData)}`;
+    const clientDataJSONString = JSON.stringify(obtainedClientDataJSON);
+    const challengeLocation = 23;
+    const responseTypeLocation = 1;
+    const requireUserVerification = false;
+    const { r, s } = Passkey.normalizeSignature(signature);
+    const rValue = `0x${BigInt(r).toString(16)}`;
+    const sValue = `0x${BigInt(s).toString(16)}`;
+    logger.debug({
+      authenticatorData: authenticatorDataString,
+      requireUserVerification,
+      clientDataJson: clientDataJSONString,
+      challengeLocation,
+      responseTypeLocation,
+      r: rValue,
+      s: sValue,
+    });
+    return {
+      authenticatorData: authenticatorDataString,
+      requireUserVerification,
+      clientDataJson: clientDataJSONString,
+      challengeLocation,
+      responseTypeLocation,
+      r: rValue,
+      s: sValue,
+      error: null,
+    };
+  }
+
   static async get({ allowCredentials = [] }: { allowCredentials?: PublicKeyCredentialDescriptor[] }): Promise<PasskeyCredentialResponse> {
     logger.debug('(🪪,ℹ️) Obtaining credentials');
     const randomUUID = crypto.randomUUID()

@@ -15,6 +15,7 @@ import {
   SimpleGrid,
 } from "@chakra-ui/react";
 import { useLocalStorage } from "usehooks-ts";
+import ethers from "ethers";
 
 import { Passkey, truncate } from "../lib/passkey";
 import { logger } from "../lib/logger";
@@ -123,6 +124,13 @@ export const PasskeyManager = () => {
       const assertation = response as AuthenticatorAssertionResponse;
       if (publicKeyAsHexString) {
         const publicKey = Passkey.hex2buf(publicKeyAsHexString);
+        const pubKeyAsCryptoKey = await Passkey.importPublicKeyAsCryptoKey(
+          publicKey
+        );
+        const pubKeyXYCoord = await Passkey.getPublicKeyXYCoordinate(
+          pubKeyAsCryptoKey
+        );
+        console.log(pubKeyXYCoord);
         const verificationData = await Passkey.verifySignature({
           publicKey,
           assertation,
@@ -130,6 +138,20 @@ export const PasskeyManager = () => {
         logger.info("(🪪,✅) Verification", verificationData);
       }
     }
+  };
+
+  const getPasskeySignatureData = async () => {
+    // const allowCredentials: PublicKeyCredentialDescriptor[] = [
+    //   {
+    //     id: Passkey.parseBase64url(ethers.toUtf8String(credentialId)),
+    //     type: "public-key",
+    //   },
+    // ];
+
+    const signatureData = await Passkey.getPasskeySignatureData(
+      "0x694f385fd69dbf8ec65d47a5237d7e770ef3ce9bbad31fc6b4420e45c408a9be"
+    );
+    console.log(signatureData);
   };
 
   return (
@@ -161,11 +183,19 @@ export const PasskeyManager = () => {
           </MenuGroup>
           <MenuItem
             aria-label="Load Passkey"
-            onClick={getAssertionHandler}
+            onClick={() => getAssertionHandler()}
             icon={<ViewIcon />}
             command="Any available"
           >
             <Text>Load Passkey</Text>
+          </MenuItem>
+          <MenuItem
+            aria-label="Load Passkey"
+            onClick={() => getPasskeySignatureData()}
+            icon={<ViewIcon />}
+            command="Any available"
+          >
+            <Text>Sign</Text>
           </MenuItem>
           <MenuGroup title="Current key">
             {credentialId && walletAddress ? (
